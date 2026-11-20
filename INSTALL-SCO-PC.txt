@@ -1,0 +1,210 @@
+Перенесення ScoPosAdapter на ПК, де вже стоїть VSS
+==================================================
+Ціль: VSS GUI і POS Adapter на одній машині (SCO PC).
+BAF POS system — інший сервер (HTTP). Перший день можна
+підняти лише VSS <-> адаптер без BAF (мок).
+
+
+0. Що вже є в проєкті
+---------------------
+README.md            — збірка і відлагодження, не чекліст встановлення.
+install-service.ps1  — опційна Windows-служба (див. крок 6).
+Цей файл             — що робити на SCO PC.
+
+
+1. Що взяти збілду (не весь репозиторій)
+----------------------------------------
+На машині розробки:
+
+  cd C:\1C\Самокаса\ScoPosAdapter
+  dotnet build -c Release
+
+Скопіювати каталог:
+
+  bin\Release\net48\
+
+Мінімальний склад:
+  ScoPosAdapter.exe
+  ScoPosAdapter.exe.config     (це App.config після збірки)
+  csPOSAdapterLibrary_4_0.dll
+  install-service.ps1          (якщо ставитимете службу)
+
+Не копіювати: obj\, вихідники .cs, .csproj (на SCO PC вони не потрібні).
+
+Рекомендований шлях на SCO PC (узгодити з полем VSS «POS / POS Adapter»):
+
+  C:\ScoPosAdapter\ScoPosAdapter.exe
+
+
+2. Супутнє ПЗ
+-------------
+Адаптер — це .NET Framework 4.8, x64 (не .NET 6/8, не .NET Core).
+Клієнт BAF / 1С на SCO PC не потрібен.
+
+На SCO PC (разом з VSS), обов’язково:
+
+  1. Windows 10/11 або Windows Server, 64-bit.
+
+  2. .NET Framework 4.8 Runtime (x64).
+     Перевірка: «Програми та засоби» / реєстр, або
+       Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" | Select Release
+     Release >= 528040 — 4.8 вже є.
+     Якщо немає — офлайн-інсталятор Microsoft:
+       «Microsoft .NET Framework 4.8 offline installer for Windows»
+       https://dotnet.microsoft.com/download/dotnet-framework/net48
+     Достатньо Runtime. Developer Pack / SDK на SCO PC не ставити.
+
+  3. Сам VSS (вже встановлений). Адаптер його не ставить.
+
+Не потрібно на SCO PC для самого адаптера:
+
+  - Visual Studio, SDK .NET, dotnet CLI
+  - Java, Python, IIS (слухач 15002 іде через HTTP.sys у Windows)
+  - клієнт BAF / Конфігуратор
+  - окремий «.NET 8 Desktop Runtime» тощо
+
+Може знадобитися пізніше (не блокер для старту адаптера):
+
+  - FMSKHttpService, якщо фіскал на цій же машині (порт 15001)
+  - драйвери / доступ до термінала Adyen — їх викликає BAF, не цей exe
+
+Права: локальний адміністратор на час netsh urlacl і встановлення служби.
+Порти не займати: 15001 (FMSK), 17002–17005 (VSS слухає), 15002 (health адаптера).
+
+
+3. Налаштувати ScoPosAdapter.exe.config на SCO PC
+-------------------------------------------------
+Відкрити файл поруч із exe (не App.config у вихідниках).
+
+Обов’язково для живого VSS:
+
+  EnableVss          true
+  VssMainHost        127.0.0.1
+  VssMainPort        17002
+  VssCancelHost      127.0.0.1
+  VssCancelPort      17003
+  VssPosEventsHost   127.0.0.1
+  VssPosEventsPort   17004
+  VssCancelPosEventsHost  127.0.0.1
+  VssCancelPosEventsPort  17005
+  VssAuthEnabled     false
+  VssReconnectSeconds  5
+
+Адаптер — TCP-клієнт. VSS має слухати 17002–17005; адаптер підключається
+і повторює спробу, якщо VSS ще не запущений.
+
+Канал authentication (17006) за замовчуванням вимкнений. У XML VSS
+його немає. Вмикати лише якщо DN підтвердить порт: VssAuthEnabled=true.
+
+LaneId — серійний номер каси ККМ у BAF (поки можна SCO01).
+
+Перший день (немає HTTP до BAF):
+
+  UseErpMock         true
+  EnableVss          true
+
+Оплата тоді приймається локально (мок), без Adyen/BAF.
+
+Коли BAF доступний з цього ПК:
+
+  UseErpMock         false
+  ErpBaseUrl         http://<хост-BAF>/<публікація>/hs
+                     (адаптер додає /sco/v1/lanes/{laneId}/...)
+  ErpAuth            Os | Basic | None
+  ErpTimeoutSeconds  не менше 15
+
+Товари, зміна, чек, void рядка, картка лояльності, preparePayment
+і payWithCard ідуть у HTTP SCO BAF. Finish/void чека, unprepare
+і фіскал у BAF ще заглушки — після картки статус може лишитися
+TransactionActive.
+
+  ErpPaymentTimeoutSeconds  120 (очікування термінала Adyen)
+
+
+4. Як запускати (вибрати ОДИН спосіб)
+-------------------------------------
+Не запускати два екземпляри exe: HTTP.sys 183 на 15002 і два клієнти
+на канали VSS.
+
+Варіант A — VSS сам запускає POS Adapter
+  У VSS вказати шлях до ScoPosAdapter.exe (без аргументів).
+  EnableVss=true у .exe.config.
+  Службу ScoPosAdapter НЕ ставити (або зупинити).
+  Без аргументів exe лишається консольним процесом — так і треба,
+  навіть якщо сам VSS працює як служба.
+
+  Ручна перевірка ДО VSS:
+
+    ScoPosAdapter.exe
+
+Варіант B — адаптер уже працює, VSS лише слухає порти
+  Служба auto-start (binPath з --service) АБО консоль без аргументів.
+  У VSS не запускати другий екземпляр того ж exe.
+
+Рекомендація на перший захід: спочатку ScoPosAdapter.exe, переконатися
+в GET /health і логах, потім або VSS launch, або служба.
+
+
+5. URL ACL для debug HTTP (15002)
+---------------------------------
+Слухач лише localhost (не http://+:15002/). Від адміністратора:
+
+  netsh http add urlacl url=http://127.0.0.1:15002/ user=Everyone
+
+Перевірка, що процес живий:
+
+  GET http://127.0.0.1:15002/health
+
+Очікувані поля: ok, posStatus, useErpMock, vssEnabled, vssConnected,
+vssLastError. Якщо HTTP не піднявся, адаптер усе одно конектиться до VSS.
+
+Логи: підкаталог logs поруч із exe (LogDirectory).
+
+
+6. Служба Windows (опційно, варіант B)
+--------------------------------------
+Від адміністратора, з каталогу, де лежить exe:
+
+  powershell -ExecutionPolicy Bypass -File install-service.ps1
+
+Служба: ScoPosAdapter, start= auto, binPath з --service,
+автоперезапуск при збої. Повторний запуск скрипта оновлює службу.
+Не ставити, якщо VSS сам стартує цей exe.
+
+
+7. Що сказати / перевірити у VSS
+--------------------------------
+- Executable: той самий ScoPosAdapter.exe, без --service.
+- connections host=localhost, порти 17002–17005 (VSS слухає, адаптер клієнт).
+- Не потрібен порт authentication від VSS.
+- VSS не запускає клієнт BAF і не логіниться в BAF.
+
+
+8. Чекліст на місці
+-------------------
+[ ] Скопійовано net48 (exe, config, dll)
+[ ] .NET Framework 4.8 Runtime x64 (Release >= 528040)
+[ ] EnableVss=true, порти 17002–17005, VssAuthEnabled=false
+[ ] UseErpMock=true (або ErpBaseUrl на BAF, mock=false)
+[ ] Один екземпляр exe (не служба+VSS одночасно)
+[ ] GET http://127.0.0.1:15002/health  (vssConnected=true, коли VSS слухає)
+[ ] У VSS шлях до exe / localhost порти
+[ ] У логах: «VSS: все каналы подключены»
+
+
+9. Типові збої
+--------------
+Exe не стартує          — немає .NET 4.8 x64; dll заблокована
+                          (ПКМ → Властивості → Розблокувати).
+HTTP 183 / порт зайнятий — другий ScoPosAdapter на 15002.
+VSS «не бачить POS»     — EnableVss=false; адаптер не запущений;
+                          інші порти ніж у VSS; VSS ще не слухає
+                          (у /health дивіться vssLastError; адаптер
+                          сам перепідключається).
+Немає товарів з BAF     — UseErpMock ще true, або ErpBaseUrl /
+                          ErpAuth / LaneId / мережа до сервера BAF.
+Оплата не проходить     — при UseErpMock=false оплата в BAF ще
+                          не підключена (очікувано на цьому етапі).
+Канал VSS «помер»       — раніше кидався NotImplementedException;
+                          зараз непідтримувані методи відповідають
+                          помилкою і канал лишається живим.
